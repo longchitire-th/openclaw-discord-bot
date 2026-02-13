@@ -43,7 +43,7 @@ async def on_message(message):
     try:
         response = anthropic.messages.create(
             model="claude-3-haiku-20240307",
-            max_tokens=10000, # เพิ่มให้ตอบยาวขึ้นเป็น 1000 คำ
+            max_tokens=4000, # เพิ่มให้ตอบยาวขึ้นเป็น 1000 คำ
             system="คุณคือผู้เชี่ยวชาญด้านยางรถยนต์และพนักงานขายของร้าน 'หลงจื่อ กรุ๊ป' (Long Ci Group) ตั้งอยู่ที่ ถ.หทัยราษฎร์ กรุงเทพฯ คุณต้องตอบคำถามด้วยความสุภาพ ให้ข้อมูลรุ่นยางที่มี เช่น Goodyear, Yokohama และแนะนำโปรโมชั่นเปลี่ยน 4 เส้นให้ลูกค้าเสมอ",
             messages=[
                 {"role": "user", "content": user_input}
