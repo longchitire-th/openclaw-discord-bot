@@ -29,7 +29,7 @@ handler = WebhookHandler(LINE_SECRET)
 app = Flask(__name__)
 
 def get_tire_info(user_input):
-    """ดึงข้อมูลราคายางและกรองตามขนาดที่ลูกค้าพิมพ์"""
+    """ดึงข้อมูลราคายางและกรองตามขนาด โดยใช้หัวตารางตัวพิมพ์เล็กตาม Sheets"""
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
@@ -37,24 +37,51 @@ def get_tire_info(user_input):
         sheet = client.open_by_key(SHEET_ID).sheet1
         records = sheet.get_all_records()
         
-        # ปรับค่าที่ลูกค้าพิมพ์ให้เหลือแต่ตัวเลขและตัวอักษร (เช่น 275/70R16 -> 2757016)
-        clean_query = re.sub(r'[^a-zA-Z0-9]', '', user_input).lower()
+        # ปรับค่าที่ลูกค้าพิมพ์ให้เหลือแต่ตัวเลข (เช่น 265/60r18 -> 2656018)
+        clean_query = re.sub(r'[^0-9]', '', user_input)
         
         results = []
         for row in records:
-            # ดึงค่าจากคอลัมน์ size_key (ที่พี่ทำไว้ใน Google Sheets)
-            # และทำความสะอาดข้อมูลใน DB ด้วยเช่นกัน
-            db_size = re.sub(r'[^a-zA-Z0-9]', '', str(row.get('size_key', ''))).lower()
+            # ดึงค่าจากคอลัมน์ size_key (ต้องเป็นตัวพิมพ์เล็กตาม image_215065.png)
+            db_size = re.sub(r'[^0-9]', '', str(row.get('size_key', '')))
             
-            if clean_query in db_size or db_size in clean_query:
+            # ตรวจสอบว่าขนาดตรงกันหรือไม่
+            if clean_query == db_size:
                 results.append(row)
         
-        # เรียงลำดับจากปีเก่าไปปีใหม่ (Year)
+        # เรียงลำดับจากปีเก่าไปปีใหม่ (ใช้ 'year' ตัวพิมพ์เล็กตาม image_215065.png)
         sorted_results = sorted(results, key=lambda x: int(x.get('year', 0)))
         return sorted_results
     except Exception as e:
         print(f"Error reading sheet: {e}")
         return []
+
+def create_flex_message(tire_list):
+    """สร้าง Flex Message โดยดึงค่าจากหัวตารางตัวพิมพ์เล็ก"""
+    brand_groups = {}
+    for item in tire_list:
+        # ใช้ 'brand', 'year', 'price' ตัวพิมพ์เล็กทั้งหมดตาม image_215065.png
+        b = item.get('brand', 'ไม่ระบุแบรนด์')
+        y = item.get('year', 'ไม่ระบุปี')
+        p = item.get('price', '0')
+        
+        if b not in brand_groups:
+            brand_groups[b] = []
+        brand_groups[b].append(f"{y} (ราคา {p}.-)")
+
+    contents = []
+    for brand, details in brand_groups.items():
+        contents.append({
+            "type": "box",
+            "layout": "vertical",
+            "margin": "lg",
+            "contents": [
+                {"type": "text", "text": brand, "weight": "bold", "color": "#1DB446", "size": "sm"},
+                {"type": "text", "text": ", ".join(details), "wrap": True, "color": "#444444", "size": "xs"}
+            ]
+        })
+    
+    # ... (ส่วนโครงสร้าง Flex อื่นๆ เหมือนเดิม)
 
 def create_flex_message(tire_list):
     """สร้าง Flex Message บัลเบิ้ลที่มีโลโก้และจัดกลุ่มตามแบรนด์"""
