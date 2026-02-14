@@ -2,7 +2,6 @@ import discord
 import os
 import threading
 import gspread
-import json
 import re
 from flask import Flask, request, abort
 from anthropic import Anthropic
@@ -12,7 +11,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendM
 from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. การตั้งค่าตัวแปร
+# 1. ตั้งค่าตัวแปร
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -21,12 +20,17 @@ LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 SHEET_ID = os.getenv("SPREADSHEET_ID")
 
 # =========================
-# 2. การตั้งค่าระบบ
+# 2. ตั้งค่าระบบ AI และฐานข้อมูล
 # =========================
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 app = Flask(__name__)
+
+# ตั้งค่า Discord Intents (สร้างตัวแปร client ไว้ล่วงหน้ากัน Error)
+intents = discord.Intents.default()
+intents.message_content = True
+discord_client = discord.Client(intents=intents)
 
 def clean_text(text):
     """ลบอักขระพิเศษเพื่อให้ค้นหาได้ทุกรูปแบบ"""
@@ -43,23 +47,18 @@ def get_tire_data(user_input):
         
         user_clean = clean_text(user_input)
         
-        # 1. ตรวจสอบว่าเป็นคำถามทั่วไป (Consultation) หรือการค้นหา (Search)
-        # ถ้าไม่มีตัวเลขที่ดูเหมือนขนาดยาง ให้ส่งไปให้ AI ตอบ
-        if not re.search(r'\d', user_input):
-            return None, "consult"
-
-        # 2. ค้นหาในฐานข้อมูล (Search Mode)
+        # ค้นหาในฐานข้อมูล
         matches = []
         for r in records:
             db_size = clean_text(r.get('size_key', ''))
-            # ค้นหาแบบกว้าง (Partial Match) เพื่อรองรับ 19514 หรือ 33125015
-            if user_clean in db_size or db_size in user_clean:
+            # ค้นหาแบบกว้างเพื่อรองรับทุกลักษณะการพิมพ์
+            if user_clean == db_size or db_size in user_clean:
                 matches.append(r)
         
         if not matches:
-            return None, "consult" # ถ้าหาไม่เจอ ให้ AI ช่วยแนะนำแทน
+            return None
 
-        # จัดกลุ่มและหาปีล่าสุด
+        # หาปีใหม่ที่สุดของแต่ละแบรนด์
         latest_by_brand = {}
         for r in matches:
             brand = r.get('brand', 'Unknown')
@@ -67,31 +66,17 @@ def get_tire_data(user_input):
             if brand not in latest_by_brand or year > int(latest_by_brand[brand].get('year', 0)):
                 latest_by_brand[brand] = r
                 
-        return list(latest_by_brand.values()), "summary"
-
+        return list(latest_by_brand.values())
     except Exception as e:
-        print(f"Error: {e}")
-        return [], "error"
+        print(f"Database Error: {e}")
+        return None
 
 def ask_ai_expert(user_input):
-    """AI พนักงานขายมือโปร ตอบคำถามเรื่องสเป็ครถ ล้อ และยาง"""
+    """AI ตอบคำถามเรื่องสเป็ครถ ล้อ และการแนะนำยาง"""
     try:
-        # ดึงข้อมูลจาก Sheets ไปให้ AI ใช้เป็นฐานความรู้ (ถ้ามี)
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
-        client = gspread.authorize(creds)
-        sheet = client.open_by_key(SHEET_ID).sheet1
-        tire_data = str(sheet.get_all_records()[:20]) # ส่งตัวอย่างข้อมูลให้ AI
-
-        system_prompt = f"""คุณคือพนักงานขายอัจฉริยะของร้าน 'หลงจื่อ กรุ๊ป' (Long Ci Group) 
-        ที่มีความเชี่ยวชาญเรื่องยางรถยนต์ (รวมถึงยาง Off-road, กระบะบรรทุก) สเป็คล้อแม็ก และการแต่งรถ
-        นี่คือข้อมูลสต็อกบางส่วน: {tire_data}
-        
-        หน้าที่ของคุณ:
-        1. แนะนำขนาดยางที่เหมาะสมกับรถรุ่นที่ลูกค้าถาม
-        2. ตอบคำถามเรื่องสเป็คล้อ เช่น Offset, PCD หรือความกว้างล้อ
-        3. ถ้าลูกค้าถามขนาดยางที่ไม่มีในสต็อก ให้แนะนำขนาดใกล้เคียงหรือรุ่นที่เหมาะสม
-        4. ตอบด้วยความสุภาพ มืออาชีพ และปิดการขายให้ได้"""
+        system_prompt = """คุณคือผู้เชี่ยวชาญด้านยางรถยนต์และล้อแม็ก 
+        ตอบคำถามเรื่องการเลือกเบอร์ยางให้เหมาะกับรุ่นรถ สเป็คล้อ (Offset/PCD) 
+        และคำแนะนำทั่วไปเกี่ยวกับการใช้รถ ตอบด้วยความสุภาพและเป็นมืออาชีพ"""
 
         response = anthropic.messages.create(
             model="claude-3-haiku-20240307",
@@ -101,17 +86,17 @@ def ask_ai_expert(user_input):
         )
         return response.content[0].text
     except Exception as e:
-        return f"ขออภัยครับพี่อิทธิพล ติดปัญหาที่ AI: {e}"
+        return "ขออภัยครับ ติดขัดบางประการในการประมวลผลคำถามนี้"
 
 def create_flex_carousel(tire_list):
-    """สร้างบัลเบิ้ลสไลด์ข้าง พร้อมโลโก้และปุ่ม Action"""
+    """สร้างบัลเบิ้ลสไลด์ข้าง พร้อมปุ่ม Action"""
     bubbles = []
     for item in tire_list:
-        brand = item.get('brand', 'ไม่ระบุ')
-        year = item.get('year', 'ไม่ระบุ')
+        brand = item.get('brand', '-')
+        year = item.get('year', '-')
         price = item.get('price', '0')
         model = item.get('model', '-')
-        size_display = item.get('ขนาด', '-')
+        size_display = item.get('ขนาด', '-') # คอลัมน์ A
 
         bubble = {
             "type": "bubble",
@@ -138,7 +123,7 @@ def create_flex_carousel(tire_list):
             "footer": {
                 "type": "box", "layout": "vertical",
                 "contents": [
-                    {"type": "button", "action": {"type": "message", "label": "สนใจรุ่นนี้", "text": f"ต้องการสั่งซื้อ {brand} {size_display} ปี {year}"}, "style": "primary", "color": "#1DB446"}
+                    {"type": "button", "action": {"type": "message", "label": "สนใจรุ่นนี้", "text": f"สนใจ {brand} {size_display}"}, "style": "primary", "color": "#1DB446"}
                 ]
             }
         }
@@ -146,7 +131,7 @@ def create_flex_carousel(tire_list):
     return {"type": "carousel", "contents": bubbles[:10]}
 
 # =========================
-# 3. Webhook (LINE & Discord)
+# 3. ส่วนเชื่อมต่อ (LINE & Discord)
 # =========================
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -159,20 +144,35 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
     user_msg = event.message.text
-    results, mode = get_tire_data(user_msg)
+    # ค้นหาในฐานข้อมูลก่อน
+    tire_results = get_tire_data(user_msg)
     
-    if mode == "summary" and results:
-        carousel = create_flex_carousel(results)
-        line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="ข้อมูลยาง หลงจื่อ กรุ๊ป", contents=carousel))
+    if tire_results:
+        carousel = create_flex_carousel(tire_results)
+        line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="ข้อมูลยาง", contents=carousel))
     else:
-        # ถ้าหาไม่เจอ หรือเป็นคำถามทั่วไป ให้ AI ตอบ
+        # ถ้าหาไม่เจอ ให้ AI ตอบคำแนะนำทั่วไป
         ai_reply = ask_ai_expert(user_msg)
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=ai_reply))
 
-# (ส่วน Discord และการรัน Threading เหมือนเดิม)
+@discord_client.event
+async def on_message(message):
+    if message.author == discord_client.user: return
+    tire_results = get_tire_data(message.content)
+    if tire_results:
+        reply = "📦 **รายการยางแนะนำ:**\n"
+        for item in tire_results:
+            reply += f"🔹 {item.get('brand')} ปี {item.get('year')} ราคา {item.get('price')}.-\n"
+        await message.channel.send(reply)
+    else:
+        await message.channel.send(ask_ai_expert(message.content))
+
+# =========================
+# 4. เริ่มต้นระบบ
+# =========================
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
-    client.run(TOKEN)
+    discord_client.run(TOKEN)
