@@ -25,11 +25,11 @@ handler = WebhookHandler(LINE_SECRET)
 app = Flask(__name__)
 
 # =========================
-# 2. Database Logic (Google Sheets)
+# 2. Database & AI Logic
 # =========================
 
-def get_tire_data(query=""):
-    """ค้นหายางตามขนาดที่ลูกค้าพิมพ์มา"""
+def get_tire_inventory(query=""):
+    """ดึงข้อมูลสต็อกทั้งหมดหรือกรองตามขนาดเพื่อส่งให้ AI"""
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
@@ -37,63 +37,51 @@ def get_tire_data(query=""):
         sheet = gs_client.open_by_key(SHEET_ID).sheet1
         records = sheet.get_all_records()
 
-        # ทำความสะอาดคำค้นหา (เช่น 2656018 หรือ 265/60R18 ให้เหลือแต่เลข)
+        if not query:
+            return records[:20] # ส่งตัวอย่างสต็อกให้ AI ดู
+
         clean_query = re.sub(r'[^0-9]', '', query)
-        
         matches = []
         for r in records:
-            # ดึงข้อมูลโดยไม่สนตัวพิมพ์เล็ก-ใหญ่ และรองรับชื่อ Column หลายแบบ
-            brand = r.get('Brand', r.get('แบรนด์', 'ไม่ระบุ'))
-            year = str(r.get('Year', r.get('ปี', '0')))
-            price = str(r.get('Price', r.get('ราคา', '0')))
-            size_key = re.sub(r'[^0-9]', '', str(r.get('size_key', r.get('ขนาด', ''))))
-
-            if not clean_query or clean_query in size_key:
-                matches.append({'brand': brand, 'year': year, 'price': price})
-
-        # เรียงลำดับจากปีใหม่ไปเก่า (เพื่อปิดการขายของดีก่อน)
-        return sorted(matches, key=lambda x: x['year'], reverse=True)
+            db_size_key = re.sub(r'[^0-9]', '', str(r.get('size_key', '')))
+            if clean_query == db_size_key:
+                matches.append(r)
+        
+        # เรียงปีใหม่ไปเก่า
+        return sorted(matches, key=lambda x: str(x.get('year', '0')), reverse=True)
     except Exception as e:
-        print(f"❌ Sheet Error: {e}")
-        return None
+        print(f"❌ Error: {e}")
+        return []
+
+def ask_ai_salesman(user_input):
+    """ให้ AI ทำหน้าที่เป็นพนักงานขาย วิเคราะห์คำถามและเสนอ Data จากสต็อก"""
+    # ดึงข้อมูลสต็อกที่เกี่ยวข้องมาเตรียมไว้
+    stock_results = get_tire_inventory(user_input)
+    stock_context = json.dumps(stock_results, ensure_ascii=False) if stock_results else "ไม่มีในสต็อก"
+
+    system_prompt = f"""คุณคือ 'น้องหลงจื่อ' AI พนักงานขายยางรถยนต์ของร้าน หลงจื่อ กรุ๊ป (Long Ci Group) 
+    ที่มีความเชี่ยวชาญเรื่องยางและสเป็ครถยนต์
+    
+    นี่คือข้อมูลสต็อกปัจจุบันที่เกี่ยวข้อง: {stock_context}
+    
+    หน้าที่ของคุณ:
+    1. ถ้าลูกค้าถามขนาดยาง ให้สรุปรายการจากสต็อก (แบรนด์, ปี, ราคา) ให้ชัดเจน
+    2. ถ้าลูกค้าถามเรื่องการใช้งานรถ ให้แนะนำขนาดยางที่เหมาะสมและแจ้งสต็อกที่มี
+    3. ตอบด้วยความสุภาพ มืออาชีพ และปิดการขายให้ได้โดยไม่ระบุชื่อตนเอง"""
+
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=1000,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_input}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"ขออภัยครับ ติดขัดการประมวลผล: {e}"
 
 # =========================
-# 3. UI Logic (Flex Message)
-# =========================
-
-def create_flex_message(tire_list, query_text):
-    if not tire_list:
-        return {"type": "bubble", "body": {"type": "box", "layout": "vertical", "contents": [{"type": "text", "text": "ไม่พบข้อมูลขนาดนี้ในสต็อกครับ"}]}}
-
-    contents = []
-    for item in tire_list[:10]: # แสดงสูงสุด 10 รายการป้องกัน Flex ยาวเกินไป
-        contents.append({
-            "type": "box", "layout": "horizontal", "contents": [
-                {"type": "text", "text": item['brand'], "weight": "bold", "flex": 2},
-                {"type": "text", "text": f"ปี {item['year']}", "size": "sm", "color": "#666666", "flex": 1},
-                {"type": "text", "text": f"{item['price']}.-", "align": "end", "weight": "bold", "color": "#ff0000", "flex": 2}
-            ], "margin": "md"
-        })
-
-    return {
-        "type": "bubble",
-        "header": {
-            "type": "box", "layout": "horizontal", "contents": [
-                {"type": "image", "url": "https://www.lctyre.com/wp-content/uploads/2024/01/logo-lctyre.png", "size": "xxs", "aspectMode": "fit", "flex": 1},
-                {"type": "text", "text": "LONG CI GROUP", "weight": "bold", "color": "#1DB446", "flex": 4, "gravity": "center"}
-            ]
-        },
-        "body": {
-            "type": "box", "layout": "vertical", "contents": [
-                {"type": "text", "text": f"ผลการค้นหา: {query_text}", "weight": "bold", "size": "md"},
-                {"type": "separator", "margin": "md"},
-                {"type": "box", "layout": "vertical", "margin": "md", "contents": contents}
-            ]
-        }
-    }
-
-# =========================
-# 4. Webhook & Event Handlers
+# 3. Webhook & Event Handlers
 # =========================
 
 @app.route("/callback", methods=['POST'])
@@ -107,13 +95,9 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
     msg = event.message.text
-    data = get_tire_data(msg)
-    
-    if data:
-        flex = create_flex_message(data, msg)
-        line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="เช็คสต็อกหลงจื่อ", contents=flex))
-    else:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขออภัยครับ ไม่พบข้อมูลยางขนาดที่ระบุ"))
+    # ให้ AI เป็นคนตอบโดยใช้ข้อมูลจาก Data (Google Sheets)
+    ai_reply = ask_ai_salesman(msg)
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=ai_reply))
 
 # Discord Setup
 discord_intents = discord.Intents.default()
@@ -123,17 +107,11 @@ discord_client = discord.Client(intents=discord_intents)
 @discord_client.event
 async def on_message(message):
     if message.author == discord_client.user: return
-    data = get_tire_data(message.content)
-    if data:
-        reply = f"📦 **สต็อก หลงจื่อ กรุ๊ป (ขนาด: {message.content})**\n"
-        for item in data[:15]:
-            reply += f"🔹 {item['brand']} ปี {item['year']} | ราคา {item['price']}.-\n"
-        await message.channel.send(reply)
-    else:
-        await message.channel.send("❌ ไม่พบข้อมูลในสต็อกครับ")
+    ai_reply = ask_ai_salesman(message.content)
+    await message.channel.send(ai_reply)
 
 # =========================
-# 5. Execution
+# 4. Execution
 # =========================
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
