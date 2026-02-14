@@ -3,15 +3,16 @@ import os
 import threading
 import gspread
 import json
+import re  # เพิ่ม regex สำหรับจัดการตัวอักษรพิเศษ
 from flask import Flask, request, abort
 from anthropic import Anthropic
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, FlexSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendMessage
 from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. การตั้งค่าตัวแปร (ดึงจาก Railway)
+# 1. การตั้งค่าตัวแปร
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -27,8 +28,8 @@ line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 app = Flask(__name__)
 
-def get_formatted_tire_data():
-    """ดึงข้อมูลและจัดเรียง ปีเก่า -> ใหม่ แยกตามแบรนด์"""
+def get_tire_info(user_input):
+    """ดึงข้อมูลราคายางและกรองตามขนาดที่ลูกค้าพิมพ์"""
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
@@ -36,39 +37,46 @@ def get_formatted_tire_data():
         sheet = client.open_by_key(SHEET_ID).sheet1
         records = sheet.get_all_records()
         
-        # กรองข้อมูลและเรียงลำดับ (Brand แล้วตามด้วย Year)
-        # ตรวจสอบชื่อหัวตารางใน Sheets ของพี่ด้วยนะครับว่าสะกด 'Brand' และ 'Year' หรือไม่
-        sorted_data = sorted(records, key=lambda x: (str(x.get('Brand', '')), str(x.get('Year', '0'))))
+        # ปรับค่าที่ลูกค้าพิมพ์ให้เหลือแต่ตัวเลขและตัวอักษร (เช่น 275/70R16 -> 2757016)
+        clean_query = re.sub(r'[^a-zA-Z0-9]', '', user_input).lower()
         
-        brand_summary = {}
-        for item in sorted_data:
-            b = item.get('Brand', 'ไม่ระบุแบรนด์')
-            y = str(item.get('Year', 'ไม่ระบุปี'))
-            p = str(item.get('Price', '0'))
-            if b not in brand_summary:
-                brand_summary[b] = []
-            brand_summary[b].append(f"{y} (ราคา {p}.-)")
+        results = []
+        for row in records:
+            # ดึงค่าจากคอลัมน์ size_key (ที่พี่ทำไว้ใน Google Sheets)
+            # และทำความสะอาดข้อมูลใน DB ด้วยเช่นกัน
+            db_size = re.sub(r'[^a-zA-Z0-9]', '', str(row.get('size_key', ''))).lower()
+            
+            if clean_query in db_size or db_size in clean_query:
+                results.append(row)
         
-        return brand_summary
+        # เรียงลำดับจากปีเก่าไปปีใหม่ (Year)
+        sorted_results = sorted(results, key=lambda x: int(x.get('year', 0)))
+        return sorted_results
     except Exception as e:
-        print(f"Error: {e}")
-        return None
+        print(f"Error reading sheet: {e}")
+        return []
 
-def create_flex_message(brand_data):
-    """สร้างบัลเบิ้ล Flex Message ที่มีโลโก้บริษัท"""
+def create_flex_message(tire_list):
+    """สร้าง Flex Message บัลเบิ้ลที่มีโลโก้และจัดกลุ่มตามแบรนด์"""
+    # จัดกลุ่มข้อมูลตามแบรนด์
+    brand_groups = {}
+    for item in tire_list:
+        b = item.get('brand', 'ไม่ระบุแบรนด์')
+        if b not in brand_groups: brand_groups[b] = []
+        brand_groups[b].append(f"{item.get('year')} ({item.get('price')}.-)")
+
     contents = []
-    for brand, details in brand_data.items():
+    for brand, details in brand_groups.items():
         contents.append({
             "type": "box",
-            "layout": "horizontal",
+            "layout": "vertical",
+            "margin": "lg",
             "contents": [
-                {"type": "text", "text": brand, "weight": "bold", "color": "#111111", "flex": 2},
-                {"type": "text", "text": ", ".join(details), "wrap": True, "color": "#666666", "size": "sm", "flex": 3, "align": "end"}
-            ],
-            "margin": "md"
+                {"type": "text", "text": brand, "weight": "bold", "color": "#1DB446", "size": "sm"},
+                {"type": "text", "text": ", ".join(details), "wrap": True, "color": "#444444", "size": "xs"}
+            ]
         })
 
-    # โครงสร้าง Flex Message
     flex_content = {
         "type": "bubble",
         "header": {
@@ -77,48 +85,28 @@ def create_flex_message(brand_data):
             "contents": [
                 {
                     "type": "image",
-                    "url": "https://lctyre.com/wp-content/uploads/2025/05/GYBL-2.png", # ใส่ URL โลโก้จริงของพี่
-                    "size": "xxs",
-                    "aspectMode": "fit",
-                    "flex": 1
+                    "url": "https://lctyre.com/wp-content/uploads/2025/05/GYBL-2.png",
+                    "size": "xxs", "aspectMode": "fit", "flex": 1
                 },
                 {
-                    "type": "text",
-                    "text": "LONG CI GROUP",
-                    "weight": "bold",
-                    "color": "#1DB446",
-                    "size": "sm",
-                    "flex": 4,
-                    "gravity": "center"
+                    "type": "text", "text": "LONG CI GROUP", "weight": "bold", 
+                    "color": "#111111", "size": "sm", "flex": 4, "gravity": "center"
                 }
             ]
         },
         "body": {
-            "type": "box",
-            "layout": "vertical",
+            "type": "box", "layout": "vertical",
             "contents": [
-                {"type": "text", "text": "รายการยางแยกตามปีผลิต", "weight": "bold", "size": "md"},
+                {"type": "text", "text": "📦 รายการยางแยกตามปีผลิต", "weight": "bold", "size": "md"},
                 {"type": "separator", "margin": "md"},
-                {
-                    "type": "box",
-                    "layout": "vertical",
-                    "margin": "md",
-                    "contents": contents
-                }
-            ]
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {"type": "text", "text": "หลงจื่อ กรุ๊ป ยินดีให้บริการครับ", "size": "xs", "color": "#aaaaaa", "align": "center"}
+                {"type": "box", "layout": "vertical", "contents": contents}
             ]
         }
     }
     return flex_content
 
 # =========================
-# 3. ส่วนของ LINE Webhook
+# 3. Webhook และการประมวลผล
 # =========================
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -132,39 +120,39 @@ def callback():
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
-    data = get_formatted_tire_data()
-    if data:
-        flex_msg = create_flex_message(data)
+    user_msg = event.message.text
+    tire_results = get_tire_info(user_msg)
+    
+    if tire_results:
+        flex_msg = create_flex_message(tire_results)
         line_bot_api.reply_message(
             event.reply_token,
             FlexSendMessage(alt_text="ข้อมูลราคายาง หลงจื่อ กรุ๊ป", contents=flex_msg)
         )
     else:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขออภัยครับ ไม่สามารถดึงข้อมูลได้ในขณะนี้"))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขออภัยครับ ไม่พบข้อมูลขนาดยางที่ระบุ"))
 
 # =========================
-# 4. ส่วนของ Discord Setup (ตอบเป็นข้อความปกติ)
+# 4. Discord Setup
 # =========================
 intents = discord.Intents.default()
 intents.message_content = True
 client = discord.Client(intents=intents)
 
 @client.event
-async def on_ready():
-    print(f"✅ Discord Logged in as {client.user}")
-
-@client.event
 async def on_message(message):
     if message.author == client.user: return
-    data = get_formatted_tire_data()
-    if data:
+    results = get_tire_info(message.content)
+    if results:
         reply = "📦 รายการยาง หลงจื่อ กรุ๊ป (ปีเก่า -> ใหม่):\n"
-        for brand, details in data.items():
-            reply += f"🔹 {brand}: {', '.join(details)}\n"
+        for item in results:
+            reply += f"🔹 {item.get('brand')} ปี {item.get('year')} ราคา {item.get('price')}.-\n"
         await message.channel.send(reply)
+    else:
+        await message.channel.send("ไม่พบข้อมูลขนาดยางครับ")
 
 # =========================
-# 5. การรันระบบ
+# 5. รันระบบ
 # =========================
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
