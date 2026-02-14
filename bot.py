@@ -16,14 +16,36 @@ intents.message_content = True
 
 client = discord.Client(intents=intents)
 
+
 # =========================
 # Claude Setup
 # =========================
 anthropic = Anthropic(api_key=ANTHROPIC_API_KEY)
 
+# --- วางฟังก์ชันดึงราคายางตรงนี้ครับ ---
+def get_tire_price(tire_name):
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        # อย่าลืมอัปโหลดไฟล์ service_account.json ขึ้น GitHub ด้วยนะครับ
+        creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
+        client = gspread.authorize(creds)
+        
+        # ดึง ID จาก Railway Shared Variables ที่คุณพี่ตั้งค่าไว้
+        sheet = client.open_by_key(os.getenv("SPREADSHEET_ID")).sheet1
+        records = sheet.get_all_records()
+        
+        for row in records:
+            # แก้คำว่า 'Model' และ 'Price' ให้ตรงกับหัวตารางใน Google Sheets ของพี่นะครับ
+            if tire_name.lower() in str(row.get('Model', '')).lower():
+                return f"รุ่น {row.get('Model')} ราคา {row.get('Price')} บาท"
+        return "ไม่พบข้อมูลรุ่นที่ระบุในฐานข้อมูลครับ"
+    except Exception as e:
+        return f"ระบบดึงข้อมูลขัดข้อง: {str(e)}"
+
 # =========================
-# Ready Event
+# Ready Event (โค้ดเดิมของพี่)
 # =========================
+
 @client.event
 async def on_ready():
     print(f"✅ Logged in as {client.user}")
