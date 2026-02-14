@@ -1,2 +1,6 @@
 discord.py
 anthropic
+flask
+line-bot-sdk==3.0.0
+gspread
+google-auth
