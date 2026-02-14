@@ -77,7 +77,7 @@ def create_flex_message(brand_data):
             "contents": [
                 {
                     "type": "image",
-                    "url": "https://www.lctyre.com/wp-content/uploads/2024/01/logo-lctyre.png", # ใส่ URL โลโก้จริงของพี่
+                    "url": "https://lctyre.com/wp-content/uploads/2025/05/GYBL-2.png", # ใส่ URL โลโก้จริงของพี่
                     "size": "xxs",
                     "aspectMode": "fit",
                     "flex": 1
