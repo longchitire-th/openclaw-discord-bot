@@ -3,7 +3,7 @@ import os
 import threading
 import gspread
 import json
-import re  # เพิ่ม regex สำหรับจัดการตัวอักษรพิเศษ
+import re
 from flask import Flask, request, abort
 from anthropic import Anthropic
 from linebot import LineBotApi, WebhookHandler
@@ -12,7 +12,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendM
 from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. การตั้งค่าตัวแปร
+# 1. การตั้งค่าตัวแปร (ดึงจาก Railway)
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -42,14 +42,14 @@ def get_tire_info(user_input):
         
         results = []
         for row in records:
-            # ดึงค่าจากคอลัมน์ size_key (ต้องเป็นตัวพิมพ์เล็กตาม image_215065.png)
+            # ดึงค่าจากคอลัมน์ size_key (ตัวพิมพ์เล็กตาม image_215065.png)
             db_size = re.sub(r'[^0-9]', '', str(row.get('size_key', '')))
             
-            # ตรวจสอบว่าขนาดตรงกันหรือไม่
+            # ตรวจสอบความถูกต้อง ถ้าขนาดตรงกันให้เก็บข้อมูลไว้
             if clean_query == db_size:
                 results.append(row)
         
-        # เรียงลำดับจากปีเก่าไปปีใหม่ (ใช้ 'year' ตัวพิมพ์เล็กตาม image_215065.png)
+        # เรียงลำดับจากปีผลิตเก่าไปใหม่ (ใช้ 'year' ตัวพิมพ์เล็ก)
         sorted_results = sorted(results, key=lambda x: int(x.get('year', 0)))
         return sorted_results
     except Exception as e:
@@ -57,17 +57,18 @@ def get_tire_info(user_input):
         return []
 
 def create_flex_message(tire_list):
-    """สร้าง Flex Message โดยดึงค่าจากหัวตารางตัวพิมพ์เล็ก"""
+    """สร้าง Flex Message บัลเบิ้ลที่มีโลโก้และจัดกลุ่มตามแบรนด์"""
     brand_groups = {}
     for item in tire_list:
-        # ใช้ 'brand', 'year', 'price' ตัวพิมพ์เล็กทั้งหมดตาม image_215065.png
+        # ใช้หัวตารางตัวพิมพ์เล็กตามฐานข้อมูล
         b = item.get('brand', 'ไม่ระบุแบรนด์')
         y = item.get('year', 'ไม่ระบุปี')
         p = item.get('price', '0')
+        m = item.get('model', '')
         
         if b not in brand_groups:
             brand_groups[b] = []
-        brand_groups[b].append(f"{y} (ราคา {p}.-)")
+        brand_groups[b].append(f"ปี {y} | {m}\nราคา {p}.-")
 
     contents = []
     for brand, details in brand_groups.items():
@@ -77,30 +78,7 @@ def create_flex_message(tire_list):
             "margin": "lg",
             "contents": [
                 {"type": "text", "text": brand, "weight": "bold", "color": "#1DB446", "size": "sm"},
-                {"type": "text", "text": ", ".join(details), "wrap": True, "color": "#444444", "size": "xs"}
-            ]
-        })
-    
-    # ... (ส่วนโครงสร้าง Flex อื่นๆ เหมือนเดิม)
-
-def create_flex_message(tire_list):
-    """สร้าง Flex Message บัลเบิ้ลที่มีโลโก้และจัดกลุ่มตามแบรนด์"""
-    # จัดกลุ่มข้อมูลตามแบรนด์
-    brand_groups = {}
-    for item in tire_list:
-        b = item.get('brand', 'ไม่ระบุแบรนด์')
-        if b not in brand_groups: brand_groups[b] = []
-        brand_groups[b].append(f"{item.get('year')} ({item.get('price')}.-)")
-
-    contents = []
-    for brand, details in brand_groups.items():
-        contents.append({
-            "type": "box",
-            "layout": "vertical",
-            "margin": "lg",
-            "contents": [
-                {"type": "text", "text": brand, "weight": "bold", "color": "#1DB446", "size": "sm"},
-                {"type": "text", "text": ", ".join(details), "wrap": True, "color": "#444444", "size": "xs"}
+                {"type": "text", "text": "\n".join(details), "wrap": True, "color": "#444444", "size": "xs", "margin": "xs"}
             ]
         })
 
@@ -128,12 +106,19 @@ def create_flex_message(tire_list):
                 {"type": "separator", "margin": "md"},
                 {"type": "box", "layout": "vertical", "contents": contents}
             ]
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {"type": "text", "text": "หลงจื่อ กรุ๊ป ยินดีให้บริการครับ", "size": "xs", "color": "#aaaaaa", "align": "center"}
+            ]
         }
     }
     return flex_content
 
 # =========================
-# 3. Webhook และการประมวลผล
+# 3. Webhook และการประมวลผล (LINE)
 # =========================
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -167,6 +152,10 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 @client.event
+async def on_ready():
+    print(f"✅ Discord Logged in as {client.user}")
+
+@client.event
 async def on_message(message):
     if message.author == client.user: return
     results = get_tire_info(message.content)
@@ -176,12 +165,13 @@ async def on_message(message):
             reply += f"🔹 {item.get('brand')} ปี {item.get('year')} ราคา {item.get('price')}.-\n"
         await message.channel.send(reply)
     else:
-        await message.channel.send("ไม่พบข้อมูลขนาดยางครับ")
+        await message.channel.send("ขออภัยครับ ไม่พบข้อมูลขนาดยางที่ระบุ")
 
 # =========================
-# 5. รันระบบ
+# 5. การรันระบบ (Threading)
 # =========================
 def run_flask():
+    # ใช้พอร์ต 8080 ตามที่ Railway แจ้งในหน้า Logs
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
 if __name__ == "__main__":
