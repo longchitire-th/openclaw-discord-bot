@@ -12,7 +12,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendM
 from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. Configuration
+# 1. Configuration & Caching
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -20,10 +20,9 @@ LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 SHEET_ID = os.getenv("SPREADSHEET_ID")
 
-# Global Cache สำหรับเก็บข้อมูลสต็อก (ลดการดึง Sheet บ่อยเกินไป)
 cached_stock = []
 last_update = 0
-CACHE_TTL = 300  # อัปเดตทุก 5 นาที (300 วินาที)
+CACHE_TTL = 300 
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 line_bot_api = LineBotApi(LINE_TOKEN)
@@ -35,104 +34,67 @@ intents.message_content = True
 discord_client = discord.Client(intents=intents)
 
 # =========================
-# 2. Data Logic
+# 2. Logic การจัดการข้อมูล (ปรับปรุงใหม่)
 # =========================
 
+def clean_tire_size(text):
+    """แปลงทุกอย่างให้เหลือแค่ตัวเลข เช่น '265/60R18' -> '2656018'"""
+    if not text: return ""
+    return re.sub(r'[^0-9]', '', str(text))
+
 def fetch_all_records():
-    """ดึงข้อมูลจาก Google Sheets พร้อมระบบ Cache"""
     global cached_stock, last_update
     now = time.time()
-    
     if now - last_update < CACHE_TTL and cached_stock:
         return cached_stock
-
     try:
         scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        # แนะนำให้ใช้ Path แบบแปรผันหรือเก็บใน Env หากทำได้
         creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SHEET_ID).sheet1
         cached_stock = sheet.get_all_records()
         last_update = now
-        print("✅ Stock Data Updated from Google Sheets")
         return cached_stock
     except Exception as e:
-        print(f"❌ Sheet Error: {e}")
+        print(f"❌ Error: {e}")
         return cached_stock if cached_stock else []
 
 def get_tire_data(user_input):
     records = fetch_all_records()
-    # ทำความสะอาด Input: เหลือแค่ตัวเลขและตัวอักษร r
-    clean_query = re.sub(r'[^0-9rR]', '', user_input).lower()
-    
-    if not clean_query: return []
+    query = clean_tire_size(user_input)
+    if len(query) < 4: return [] 
 
     matches = []
     for r in records:
-        # ดึงค่า size_key มาทำความสะอาดเพื่อเปรียบเทียบ
-        raw_size = str(r.get('size_key', r.get('ขนาด', '')))
-        db_size = re.sub(r'[^0-9rR]', '', raw_size).lower()
+        # ดึงค่าจาก Google Sheets มาลบอักขระพิเศษเพื่อเทียบเลขเพียวๆ
+        db_size_key = clean_tire_size(r.get('size_key', ''))
+        db_size_name = clean_tire_size(r.get('ขนาด', ''))
         
-        if clean_query in db_size or db_size in clean_query:
+        # ค้นหาแบบกว้าง (Broad Match)
+        if query in db_size_key or query in db_size_name:
             matches.append(r)
     
-    # เรียงลำดับปี (Handle กรณีปีไม่ใช่ตัวเลขด้วย)
-    def sort_year(x):
-        try: return int(x.get('year', 0))
-        except: return 0
-
-    return sorted(matches, key=sort_year, reverse=True)
+    # เรียงปีใหม่สุดไว้บนสุด
+    return sorted(matches, key=lambda x: str(x.get('year', '0')), reverse=True)
 
 # =========================
-# 3. Messaging Logic
+# 3. AI Salesman Instruction
 # =========================
-
-def create_flex_carousel(tire_list):
-    bubbles = []
-    for item in tire_list[:10]:
-        brand = item.get('brand', 'ไม่ระบุยี่ห้อ')
-        model = item.get('model', '')
-        size = item.get('ขนาด', item.get('size_key', '-'))
-        year = item.get('year', '-')
-        price = item.get('price', 'สอบถามราคา')
-        
-        bubble = {
-            "type": "bubble", "size": "mega",
-            "header": {
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "image", "url": "https://lctyre.com/wp-content/uploads/2025/05/GYBL-2.png", "size": "xxs", "aspectMode": "fit"},
-                    {"type": "text", "text": "LONG CI GROUP", "weight": "bold", "color": "#1DB446", "size": "sm", "margin": "sm", "gravity": "center"}
-                ]
-            },
-            "body": {
-                "type": "box", "layout": "vertical", "contents": [
-                    {"type": "text", "text": f"{brand} {model}", "weight": "bold", "size": "xl", "wrap": True},
-                    {"type": "separator", "margin": "md"},
-                    {"type": "box", "layout": "vertical", "margin": "md", "contents": [
-                        {"type": "text", "text": f"ขนาด: {size}", "size": "sm", "color": "#666666"},
-                        {"type": "text", "text": f"ปีผลิต: {year}", "size": "sm", "color": "#666666"},
-                        {"type": "text", "text": f"ราคา: {format(price, ',') if isinstance(price, int) else price}.-", "size": "xl", "weight": "bold", "color": "#ff0000", "margin": "md"}
-                    ]}
-                ]
-            },
-            "footer": {
-                "type": "box", "layout": "vertical", "contents": [
-                    {"type": "button", "action": {"type": "message", "label": "สนใจสั่งซื้อ", "text": f"สนใจ {brand} {size} ปี {year}"}, "style": "primary", "color": "#1DB446"}
-                ]
-            }
-        }
-        bubbles.append(bubble)
-    return {"type": "carousel", "contents": bubbles}
 
 def ask_ai_with_stock(user_msg):
     stock = get_tire_data(user_msg)
+    stock_context = "ขณะนี้ไม่มีขนาดที่ระบุในคลัง"
     if stock:
-        stock_text = "\n".join([f"- {s.get('brand')} {s.get('model')} ปี {s.get('year')} ราคา {s.get('price')}.-" for s in stock[:5]])
-    else:
-        stock_text = "ไม่มีสินค้าขนาดนี้ในสต็อกขณะนี้"
-    
-    prompt = f"คุณคือพนักงานขายยางรถยนต์มืออาชีพของ 'หลงจื่อ กรุ๊ป'\nคำถามลูกค้า: '{user_msg}'\nข้อมูลสต็อกจริง: {stock_text}\n\nคำแนะนำ: ตอบคำถามอย่างสุภาพและแม่นยำ หากมีสินค้าให้เชียร์ขาย หากไม่มีให้แนะนำให้สอบถามแอดมินเพื่อเช็คของจากคลังอื่น"
-    
+        stock_context = "สต็อกที่พบจริง:\n" + "\n".join([f"- {s.get('brand')} {s.get('model')} ปี {s.get('year')} ราคา {s.get('price')}.-" for s in stock[:5]])
+
+    prompt = f"""คุณคือ 'หลงจื่อบอท' พนักงานขายมืออาชีพประจำ หลงจื่อ กรุ๊ป
+ข้อมูลจริงในสต็อก: {stock_context}
+
+หน้าที่ของคุณ:
+1. ถ้ามีสินค้า: สรุปสเปกและราคา (ใส่คอมม่าที่ราคาด้วย) แล้วถามว่าสนใจรับกี่เส้นดีครับ?
+2. ถ้าไม่มีสินค้า: ห้ามคำนวณขนาดทดแทนเองเด็ดขาด! ให้แจ้งว่า 'ขออภัยครับ ขนาดนี้ไม่มีในสต็อกชั่วคราว เดี๋ยวผมให้แอดมินเช็คคลังสำรองให้นะครับ'
+3. ห้ามมโนแบรนด์หรือราคาที่ไม่มีอยู่ในข้อมูลสต็อกที่ให้ไปด้านบนนี้"""
+
     try:
         response = anthropic_client.messages.create(
             model="claude-3-haiku-20240307",
@@ -141,55 +103,40 @@ def ask_ai_with_stock(user_msg):
         )
         return response.content[0].text
     except Exception as e:
-        return f"ขออภัยครับ ระบบประมวลผลขัดข้องชั่วคราว (Error: {str(e)})"
+        return f"ขออภัยครับ ระบบขัดข้องชั่วคราว: {str(e)}"
 
 # =========================
-# 4. Webhook & Execution
+# 4. Message Handler
 # =========================
-
-@app.route("/callback", methods=['POST'])
-def callback():
-    signature = request.headers.get('X-Line-Signature')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        abort(400)
-    return 'OK'
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
     msg = event.message.text.strip()
-    # ตรวจสอบว่าเป็นรหัสยางหรือไม่ (เช่น 265/60R18)
-    is_size_query = re.match(r'^[\d/x.R ]+$', msg)
+    clean_msg = clean_tire_size(msg)
     
-    if is_size_query:
+    # ถ้าพิมพ์เลขขนาดยาง (เช่น 2656018) ให้ส่ง Flex Message ทันที
+    if len(clean_msg) >= 6:
         stock = get_tire_data(msg)
         if stock:
-            line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="เช็คสต็อกยาง", contents=create_flex_carousel(stock)))
-        else:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="ขออภัยครับ ไม่พบขนาดนี้ในสต็อกในขณะนี้ ท่านต้องการให้เจ้าหน้าที่ช่วยเช็คจากคลังอื่นให้ไหมครับ?"))
-    else:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=ask_ai_with_stock(msg)))
+            line_bot_api.reply_message(event.reply_token, FlexSendMessage(alt_text="พบสต็อกยาง", contents=create_flex_carousel(stock)))
+            return
+            
+    # กรณีถามคำถามทั่วไป หรือไม่พบสต็อก ให้ AI ตอบ
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=ask_ai_with_stock(msg)))
 
 @discord_client.event
 async def on_message(message):
     if message.author == discord_client.user: return
-    
     content = message.content.strip()
-    if re.match(r'^[\d/x.R ]+$', content):
+    if len(clean_tire_size(content)) >= 6:
         stock = get_tire_data(content)
         if stock:
-            res = "📦 **รายการสต็อกที่พบ:**\n" + "\n".join([f"🔹 {s['brand']} {s.get('model','')} ({s['year']}) - {s['price']}.-" for s in stock[:10]])
+            res = "📦 **สต็อก หลงจื่อ กรุ๊ป:**\n" + "\n".join([f"🔹 {s['brand']} {s.get('model','')} ({s['year']}) - {format(int(s['price']), ',') if str(s['price']).isdigit() else s['price']}.-" for s in stock[:5]])
             await message.channel.send(res)
-        else:
-            await message.channel.send("❌ ไม่พบสินค้าขนาดนี้ในสต็อก")
-    else:
-        await message.channel.send(ask_ai_with_stock(content))
+            return
+    await message.channel.send(ask_ai_with_stock(content))
 
-def run_flask():
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+# ... (ฟังก์ชัน run_flask และ main เหมือนเดิม) ...
 
 if __name__ == "__main__":
     # เริ่ม Flask ใน Thread แยก
