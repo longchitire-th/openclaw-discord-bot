@@ -5,15 +5,17 @@ import gspread
 import re
 import time
 from flask import Flask, request, abort
+from anthropic import Anthropic
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. การตั้งค่าระบบ
+# 1. Configuration
 # =========================
 TOKEN = os.getenv("DISCORD_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
 SHEET_ID = os.getenv("SPREADSHEET_ID")
@@ -22,6 +24,7 @@ cached_stock = []
 last_update = 0
 CACHE_TTL = 300 
 
+anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 line_bot_api = LineBotApi(LINE_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 app = Flask(__name__)
@@ -31,13 +34,13 @@ intents.message_content = True
 discord_client = discord.Client(intents=intents)
 
 # =========================
-# 2. ระบบดึงข้อมูลและค้นหา
+# 2. Data & Search Logic
 # =========================
 
 def clean_tire_size(text):
-    """ทำให้พิมพ์ 2656018 หรือ 265/60R18 ก็ค้นหาเจอ"""
+    """แปลงทุกรูปแบบ (265/60R18, 2656018) ให้เหลือแค่ตัวเลขเพื่อความแม่นยำ"""
     if not text: return ""
-    return re.sub(r'[^0-9xX]', '', str(text)).lower()
+    return re.sub(r'[^0-9]', '', str(text))
 
 def fetch_all_records():
     global cached_stock, last_update
@@ -51,7 +54,6 @@ def fetch_all_records():
         sheet = client.open_by_key(SHEET_ID).sheet1
         cached_stock = sheet.get_all_records()
         last_update = now
-        print("✅ ข้อมูลสต็อกอัปเดตเรียบร้อย")
         return cached_stock
     except Exception as e:
         print(f"❌ Sheet Error: {e}")
@@ -60,42 +62,45 @@ def fetch_all_records():
 def get_tire_data(user_input):
     records = fetch_all_records()
     query = clean_tire_size(user_input)
-    if len(query) < 4: return [] 
+    if len(query) < 5: return [] 
 
     matches = []
     for r in records:
-        size_key = clean_tire_size(r.get('size_key', ''))
-        size_name = clean_tire_size(r.get('ขนาด', ''))
-        if query in size_key or query in size_name:
+        # เทียบทั้งคอลัมน์ 'size_key' และ 'ขนาด'
+        db_size_key = clean_tire_size(r.get('size_key', ''))
+        db_size_name = clean_tire_size(r.get('ขนาด', ''))
+        if query in db_size_key or query in db_size_name:
             matches.append(r)
-    return matches
+    return sorted(matches, key=lambda x: str(x.get('year', '0')), reverse=True)
 
 # =========================
-# 3. ส่วนการตอบกลับ (เน้นแจ้งราคา)
+# 3. AI & Web Server Logic
 # =========================
 
-def format_stock_response(matches):
-    if not matches:
-        return "ขออภัยครับ ไม่พบขนาดสินค้าที่ท่านค้นหาในสต็อกขณะนี้"
+def ask_ai_with_stock(user_msg):
+    stock = get_tire_data(user_msg)
+    stock_context = "ไม่มีในสต็อก" if not stock else "สต็อกที่มีตอนนี้:\n" + "\n".join([f"- {s.get('brand')} {s.get('year')} {s.get('price')}.-" for s in stock[:5]])
+
+    prompt = f"คุณคือพนักงานขายของ หลงจื่อ กรุ๊ป\nคำถามลูกค้า: {user_msg}\nข้อมูลสต็อกจริง: {stock_context}\nห้ามมโนขนาดยางเองเด็ดขาด ถ้าไม่มีของให้บอกให้รอแอดมินเช็คคลังสำรอง"
     
-    response = "📦 รายการสินค้าที่พร้อมส่ง:\n"
-    for item in matches[:5]:
-        brand = item.get('brand', '-')
-        year = item.get('year', '-')
-        price = item.get('price', 'สอบถาม')
-        size = item.get('ขนาด', '-')
-        response += f"🔹 {brand} ({size}) ปี {year} \n   💰 ราคา {price}.- \n\n"
-    response += "สนใจรับรายการไหน หรือสอบถามเพิ่มเติมแจ้งได้เลยครับ"
-    return response
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    except Exception as e:
+        return f"ขออภัย ระบบขัดข้อง: {str(e)}"
 
-# =========================
-# 4. Webhook & Flask
-# =========================
-
+# ✅ เพิ่มฟังก์ชันที่หายไปเพื่อแก้ปัญหา NameError
 def run_flask():
-    """เพิ่มฟังก์ชันนี้เพื่อป้องกันระบบ NameError ล่ม"""
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
+# =========================
+# 4. Webhook & Event Handlers
+# =========================
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -108,19 +113,29 @@ def callback():
 @handler.add(MessageEvent, message=TextMessage)
 def handle_line_message(event):
     msg = event.message.text.strip()
-    if len(clean_tire_size(msg)) >= 5:
+    # ถ้าส่งแค่เบอร์ยาง ให้เช็คราคาก่อน ถ้าถามอย่างอื่นให้ AI ตอบ
+    if len(clean_tire_size(msg)) >= 6:
         stock = get_tire_data(msg)
-        reply_text = format_stock_response(stock)
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        if stock:
+            res = "📦 รายการที่พบ:\n" + "\n".join([f"🔹 {s['brand']} {s['year']} - {s['price']}.-" for s in stock[:5]])
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=res))
+            return
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=ask_ai_with_stock(msg)))
 
 @discord_client.event
 async def on_message(message):
     if message.author == discord_client.user: return
     content = message.content.strip()
-    if len(clean_tire_size(content)) >= 5:
+    # ตรรกะเดียวกับ LINE
+    if len(clean_tire_size(content)) >= 6:
         stock = get_tire_data(content)
-        await message.channel.send(format_stock_response(stock))
+        if stock:
+            res = "📦 รายการในสต็อก:\n" + "\n".join([f"🔹 {s['brand']} {s['year']} - {s['price']}.-" for s in stock[:5]])
+            await message.channel.send(res)
+            return
+    await message.channel.send(ask_ai_with_stock(content))
 
 if __name__ == "__main__":
+    # เริ่ม Flask ใน Thread แยก (แก้ปัญหา Crashed)
     threading.Thread(target=run_flask, daemon=True).start()
     discord_client.run(TOKEN)
