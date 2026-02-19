@@ -1,172 +1,262 @@
-import discord
 import os
-import threading
-import gspread
 import re
 import json
+import gspread
 from flask import Flask, request, abort
-from anthropic import Anthropic
+from google.oauth2.service_account import Credentials
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage, FlexSendMessage
-from google.oauth2.service_account import Credentials
 
 # =========================
-# 1. Configuration
+# 1. Config
 # =========================
-TOKEN = os.getenv("DISCORD_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-LINE_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-SHEET_ID = os.getenv("SPREADSHEET_ID")
+LINE_ACCESS_TOKEN  = os.environ.get("LINE_ACCESS_TOKEN", "")
+LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
+SHEET_ID   = os.environ.get("SHEET_ID", "1IhV_qpsPxW2VXp1KpvcLSgodKH-Ngk6yojrwK7Ysrdg")
+SHEET_NAME = os.environ.get("SHEET_NAME", "ตาราง1")
 
-anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
-line_bot_api = LineBotApi(LINE_TOKEN)
-handler = WebhookHandler(LINE_SECRET)
-app = Flask(__name__)
+line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
+handler      = WebhookHandler(LINE_CHANNEL_SECRET)
+app          = Flask(__name__)
 
 # =========================
-# 2. UI Helper (Flex Message Generator)
+# 2. Google Sheets
 # =========================
+def get_sheet():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    sa_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if sa_json:
+        sa_info = json.loads(sa_json)
+        creds = Credentials.from_service_account_info(sa_info, scopes=scope)
+    else:
+        creds = Credentials.from_service_account_file("service_account.json", scopes=scope)
+    client = gspread.authorize(creds)
+    return client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
 
-def create_tire_carousel(tire_list):
-    """สร้างบัลเบิ้ลสไลด์ข้างแบบมืออาชีพ"""
-    bubbles = []
-    for item in tire_list[:10]: # แสดงสูงสุด 10 รายการ
-        brand = str(item.get('brand', 'ไม่ระบุ')).upper()
-        model = str(item.get('model', '-'))
-        year = str(item.get('year', '-'))
-        price = str(item.get('price', '0'))
-        size = str(item.get('ขนาด', '-'))
+def search_tires(query):
+    try:
+        sheet   = get_sheet()
+        records = sheet.get_all_records()
+        q_digit = re.sub(r"[^0-9]", "", query)
+        if not q_digit:
+            return []
+        matched = []
+        for r in records:
+            sk = re.sub(r"[^0-9]", "", str(r.get("size_key", "")))
+            sz = re.sub(r"[^0-9]", "", str(r.get("ขนาด", "")))
+            if q_digit == sk or q_digit == sz:
+                matched.append(r)
+        return sorted(matched, key=lambda x: str(x.get("year", "0")), reverse=True)
+    except Exception as e:
+        print(f"❌ Sheet Error: {e}")
+        return []
 
-        bubble = {
-            "type": "bubble",
-            "size": "mega",
-            "header": {
-                "type": "box", "layout": "horizontal", "contents": [
-                    {"type": "image", "url": "https://lctyre.com/wp-content/uploads/2025/05/GYBL-2.png", "size": "xxs", "aspectMode": "fit", "flex": 1},
-                    {"type": "text", "text": "LONG CI GROUP", "weight": "bold", "color": "#1DB446", "size": "sm", "flex": 4, "gravity": "center"}
-                ]
-            },
-            "body": {
-                "type": "box", "layout": "vertical", "contents": [
-                    {"type": "text", "text": f"{brand} {model}", "weight": "bold", "size": "xl", "wrap": True, "color": "#111111"},
-                    {"type": "text", "text": f"ขนาด: {size}", "size": "sm", "color": "#666666", "margin": "sm"},
-                    {"type": "separator", "margin": "md"},
-                    {"type": "box", "layout": "vertical", "margin": "md", "spacing": "sm", "contents": [
-                        {"type": "box", "layout": "horizontal", "contents": [
-                            {"type": "text", "text": "ปีผลิต (DOT)", "size": "sm", "color": "#555555", "flex": 1},
-                            {"type": "text", "text": year, "size": "sm", "color": "#111111", "align": "end", "weight": "bold", "flex": 1}
-                        ]},
-                        {"type": "box", "layout": "horizontal", "contents": [
-                            {"type": "text", "text": "ราคาต่อเส้น", "size": "sm", "color": "#555555", "flex": 1},
-                            {"type": "text", "text": f"฿{price}.-", "size": "lg", "color": "#ff0000", "weight": "bold", "align": "end", "flex": 1}
-                        ]}
-                    ]}
-                ]
-            },
-            "footer": {
-                "type": "box", "layout": "vertical", "contents": [
-                    {"type": "button", "action": {"type": "message", "label": "🛒 สั่งซื้อ / สอบถาม", "text": f"สนใจสั่งซื้อ {brand} {size} ปี {year}"}, "style": "primary", "color": "#1DB446"}
-                ]
-            }
+# =========================
+# 3. รูปโลโก้/ยางแต่ละแบรนด์
+# =========================
+BRAND_IMAGES = {
+    "BRIDGESTONE": "https://upload.wikimedia.org/wikipedia/commons/thumb/6/60/Bridgestone_logo.svg/320px-Bridgestone_logo.svg.png",
+    "DUNLOP":      "https://upload.wikimedia.org/wikipedia/commons/thumb/4/44/Dunlop_Logo.svg/320px-Dunlop_Logo.svg.png",
+    "MICHELIN":    "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9e/Michelin_Logo.svg/320px-Michelin_Logo.svg.png",
+    "YOKOHAMA":    "https://upload.wikimedia.org/wikipedia/commons/thumb/5/5d/Yokohama_Rubber_Company_logo.svg/320px-Yokohama_Rubber_Company_logo.svg.png",
+    "PIRELLI":     "https://upload.wikimedia.org/wikipedia/commons/thumb/e/e5/Pirelli_logo.svg/320px-Pirelli_logo.svg.png",
+    "CONTINENTAL": "https://upload.wikimedia.org/wikipedia/commons/thumb/4/40/Continental_AG_logo.svg/320px-Continental_AG_logo.svg.png",
+    "GOODYEAR":    "https://upload.wikimedia.org/wikipedia/commons/thumb/6/68/Goodyear-Logo.svg/320px-Goodyear-Logo.svg.png",
+    "MAXXIS":      "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6a/Maxxis_logo.svg/320px-Maxxis_logo.svg.png",
+    "TOYO":        "https://upload.wikimedia.org/wikipedia/commons/thumb/9/9c/Toyo_Tires_logo.svg/320px-Toyo_Tires_logo.svg.png",
+    "FALKEN":      "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6b/Falken_Tyre_logo.svg/320px-Falken_Tyre_logo.svg.png",
+}
+
+def get_brand_image(brand):
+    key = brand.upper().strip()
+    return BRAND_IMAGES.get(key, f"https://placehold.co/200x200/eeeeee/333?text={brand}")
+
+# =========================
+# 4. Flex Message — หน้าตาตามรูป
+#    header สีเหลือง "รหัส XXX"
+#    body: ซ้าย=ข้อมูล, ขวา=รูปยาง
+#    footer: ชื่อร้าน
+# =========================
+def build_bubble(tire):
+    brand = str(tire.get("brand", "")).upper()
+    model = str(tire.get("model", "-"))
+    size  = str(tire.get("ขนาด", "-"))
+    stock = str(tire.get("stock", ""))      # คงเหลือ (ถ้ามีคอลัมน์นี้ใน Sheet)
+    dot   = str(tire.get("year", "-"))      # ปีผลิต/DOT
+    price = tire.get("price", 0)
+
+    price_text = f"฿{int(price):,}.-" if price else "ติดต่อฝ่ายขาย บาท"
+    stock_text = f"{stock} เส้น" if stock and stock not in ["-", ""] else "-"
+
+    img_url = get_brand_image(brand)
+
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        # ---- HEADER สีเหลือง ----
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#F5C518",
+            "paddingAll": "14px",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": f"รหัส {size}",
+                    "weight": "bold",
+                    "size": "lg",
+                    "color": "#1a1a1a"
+                }
+            ]
+        },
+        # ---- BODY: ซ้าย=ข้อมูล, ขวา=รูป ----
+        "body": {
+            "type": "box",
+            "layout": "horizontal",
+            "paddingAll": "14px",
+            "spacing": "md",
+            "contents": [
+                # ซ้าย — ข้อมูล
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "flex": 3,
+                    "spacing": "xs",
+                    "contents": [
+                        {
+                            "type": "text",
+                            "text": f"{brand} - {model}",
+                            "weight": "bold",
+                            "size": "sm",
+                            "color": "#111111",
+                            "wrap": True
+                        },
+                        {
+                            "type": "text",
+                            "text": f"รหัส: {size}",
+                            "size": "xs",
+                            "color": "#555555"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"คงเหลือ: {stock_text}",
+                            "size": "xs",
+                            "color": "#555555"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"DOT: {dot}",
+                            "size": "xs",
+                            "color": "#555555"
+                        },
+                        {
+                            "type": "text",
+                            "text": f"ราคา: {price_text}",
+                            "size": "xs",
+                            "color": "#555555",
+                            "wrap": True
+                        }
+                    ]
+                },
+                # ขวา — รูป
+                {
+                    "type": "image",
+                    "url": img_url,
+                    "flex": 2,
+                    "size": "full",
+                    "aspectMode": "fit",
+                    "aspectRatio": "1:1"
+                }
+            ]
+        },
+        # ---- FOOTER ----
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "8px",
+            "backgroundColor": "#f9f9f9",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": "หลงจื่อ กรุ๊ป",
+                    "size": "xxs",
+                    "color": "#aaaaaa",
+                    "align": "end"
+                }
+            ]
         }
-        bubbles.append(bubble)
+    }
+
+def build_flex(tire_list):
+    bubbles = [build_bubble(t) for t in tire_list[:10]]
+    if len(bubbles) == 1:
+        return bubbles[0]
     return {"type": "carousel", "contents": bubbles}
 
 # =========================
-# 3. Database & AI Logic
+# 5. Webhook
 # =========================
-
-def get_tire_inventory(query=""):
-    try:
-        scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-        creds = Credentials.from_service_account_file('service_account.json', scopes=scope)
-        gs_client = gspread.authorize(creds)
-        sheet = gs_client.open_by_key(SHEET_ID).sheet1
-        records = sheet.get_all_records()
-
-        clean_query = re.sub(r'[^0-9]', '', query)
-        if not clean_query: return []
-
-        matches = []
-        for r in records:
-            db_size_key = re.sub(r'[^0-9]', '', str(r.get('size_key', '')))
-            if clean_query == db_size_key:
-                matches.append(r)
-        
-        # เรียงปีใหม่ไปเก่า
-        return sorted(matches, key=lambda x: str(x.get('year', '0')), reverse=True)
-    except Exception as e:
-        print(f"❌ Database Error: {e}")
-        return []
-
-def ask_ai_salesman(user_input):
-    """AI พนักงานขายที่สรุปข้อมูลจาก Data"""
-    stock_results = get_tire_inventory(user_input)
-    # ตัดข้อมูลให้ AI เฉพาะที่จำเป็นเพื่อความรวดเร็ว
-    stock_summary = [{"brand": r.get('brand'), "year": r.get('year'), "price": r.get('price')} for r in stock_results]
-
-    system_prompt = f"""คุณคือพนักงานขายของร้าน 'หลงจื่อ กรุ๊ป'
-    นี่คือข้อมูลสต็อกปัจจุบัน: {json.dumps(stock_summary, ensure_ascii=False)}
-    หากลูกค้าถามขนาดยาง ให้คุณตอบสั้นๆ ว่า 'นี่คือรายการยางในสต็อกครับ' 
-    หากลูกค้าถามคำถามทั่วไป ให้แนะนำตามความเชี่ยวชาญ และปิดการขายด้วยความสุภาพ"""
-
-    try:
-        response = anthropic_client.messages.create(
-            model="claude-3-haiku-20240307",
-            max_tokens=500,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_input}]
-        )
-        return response.content[0].text, stock_results
-    except Exception as e:
-        return f"ขออภัยครับ ติดขัดการประมวลผล: {e}", []
-
-# =========================
-# 4. Webhook & Discord
-# =========================
-
-@app.route("/callback", methods=['POST'])
+@app.route("/callback", methods=["POST"])
 def callback():
-    signature = request.headers.get('X-Line-Signature')
+    sig  = request.headers.get("X-Line-Signature", "")
     body = request.get_data(as_text=True)
-    try: handler.handle(body, signature)
-    except InvalidSignatureError: abort(400)
-    return 'OK'
+    try:
+        handler.handle(body, sig)
+    except InvalidSignatureError:
+        abort(400)
+    return "OK"
 
 @handler.add(MessageEvent, message=TextMessage)
-def handle_line_message(event):
-    msg = event.message.text
-    ai_text, stock_data = ask_ai_salesman(msg)
-    
-    # ส่งคำตอบ AI พร้อม Flex Carousel
-    messages = [TextSendMessage(text=ai_text)]
-    if stock_data:
-        carousel = create_tire_carousel(stock_data)
-        messages.append(FlexSendMessage(alt_text="เช็คราคายาง หลงจื่อ", contents=carousel))
-    
-    line_bot_api.reply_message(event.reply_token, messages)
+def handle_message(event):
+    msg    = event.message.text.strip()
+    digits = re.sub(r"[^0-9]", "", msg)
 
-# Discord Logic
-discord_intents = discord.Intents.default()
-discord_intents.message_content = True
-discord_client = discord.Client(intents=discord_intents)
+    if len(digits) < 6:
+        # ข้อความทั่วไป
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text="👋 สวัสดีครับ! ระบบค้นหายาง\n\n"
+                     "🔍 พิมพ์ขนาดยางได้เลยครับ เช่น:\n"
+                     "• 265/60R18\n• 265/60/18\n• 2656018\n"
+                     "• 195R14\n• 33x12.50R15"
+            )
+        )
+        return
 
-@discord_client.event
-async def on_message(message):
-    if message.author == discord_client.user: return
-    ai_text, stock_data = ask_ai_salesman(message.content)
-    reply = f"🤖 AI: {ai_text}\n"
-    if stock_data:
-        reply += "\n📦 **รายการในสต็อก:**\n"
-        for s in stock_data[:10]:
-            reply += f"🔹 {s.get('brand')} | ปี {s.get('year')} | ราคา {s.get('price')}.- (ขนาด {s.get('ขนาด')})\n"
-    await message.channel.send(reply)
+    results = search_tires(msg)
 
-def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    if not results:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(
+                text=f"❌ ไม่พบยางขนาด \"{msg}\" ในสต็อก\n\n"
+                     "💡 ลองพิมพ์ใหม่ เช่น:\n"
+                     "• 265/60R18\n• 265/60/18\n• 2656018"
+            )
+        )
+        return
+
+    flex = build_flex(results)
+    line_bot_api.reply_message(
+        event.reply_token,
+        [
+            TextSendMessage(text=f"🔍 พบ {len(results)} รายการสำหรับ \"{msg}\""),
+            FlexSendMessage(alt_text=f"ราคายาง {msg}", contents=flex)
+        ]
+    )
+
+# =========================
+# 6. Health Check
+# =========================
+@app.route("/", methods=["GET"])
+def health():
+    return {"status": "ok"}, 200
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    discord_client.run(TOKEN)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
